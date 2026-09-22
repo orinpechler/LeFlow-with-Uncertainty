@@ -101,6 +101,27 @@ def _build_lewm_from_state_dict(state_dict: dict[str, torch.Tensor]) -> nn.Modul
     state_dict = OrderedDict(
         (k.removeprefix("model."), v) for k, v in state_dict.items()
     )
+
+    # The public LeWM checkpoints were saved with the legacy Hugging Face ViT
+    # parameter names. Transformers 5 uses the same ViT architecture but
+    # renamed its encoder blocks and attention/MLP projections. Remap only the
+    # legacy encoder keys, then retain strict loading to catch real mismatches.
+    legacy_vit_replacements = (
+        ("encoder.encoder.layer.", "encoder.layers."),
+        (".attention.attention.query.", ".attention.q_proj."),
+        (".attention.attention.key.", ".attention.k_proj."),
+        (".attention.attention.value.", ".attention.v_proj."),
+        (".attention.output.dense.", ".attention.o_proj."),
+        (".intermediate.dense.", ".mlp.fc1."),
+        (".output.dense.", ".mlp.fc2."),
+    )
+    remapped_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith("encoder.encoder.layer."):
+            for old, new in legacy_vit_replacements:
+                key = key.replace(old, new, 1)
+        remapped_state_dict[key] = value
+    state_dict = remapped_state_dict
     hidden_dim = state_dict["encoder.embeddings.cls_token"].shape[-1]
     patch_size = state_dict["encoder.embeddings.patch_embeddings.projection.weight"].shape[-1]
     num_patches = state_dict["encoder.embeddings.position_embeddings"].shape[1] - 1
@@ -240,7 +261,7 @@ class LatentPathFlow(nn.Module):
         self.net = nn.TransformerEncoder(enc_layer, num_layers=depth)
         self.out = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, latent_dim))
 
-    def forward(
+    def _features(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
@@ -259,7 +280,61 @@ class LatentPathFlow(nn.Module):
         )
         x = self.token_proj(x_t)
         x = x + self.pos_embedding[:, :n_tokens] + cond[:, None]
-        return self.out(self.net(x))
+        return self.net(x)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        z_start: torch.Tensor,
+        z_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.out(self._features(x_t, t, z_start, z_goal))
+
+
+class UncertaintyLatentPathFlow(LatentPathFlow):
+    """Latent path flow with diagonal heteroscedastic velocity variance.
+
+    ``forward`` deliberately keeps the :class:`LatentPathFlow` contract and
+    returns the mean velocity. Training code can call
+    :meth:`forward_with_uncertainty` to additionally receive element-wise log
+    variance. This lets existing latent planner inference consume uncertainty
+    checkpoints without changing its solver interface.
+    """
+
+    def __init__(
+        self,
+        *args,
+        min_log_variance: float = -10.0,
+        max_log_variance: float = 10.0,
+        variance_init: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.min_log_variance = min_log_variance
+        self.max_log_variance = max_log_variance
+        self.variance_init = variance_init
+        self.uncertainty_out = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.latent_dim),
+        )
+        nn.init.zeros_(self.uncertainty_out[-1].weight)
+        nn.init.constant_(self.uncertainty_out[-1].bias, variance_init)
+
+    def forward_with_uncertainty(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        z_start: torch.Tensor,
+        z_goal: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self._features(x_t, t, z_start, z_goal)
+        mean_velocity = self.out(features)
+        log_variance = self.uncertainty_out(features).clamp(
+            min=self.min_log_variance,
+            max=self.max_log_variance,
+        )
+        return mean_velocity, log_variance
 
 
 class InverseDynamics(nn.Module):
@@ -325,7 +400,12 @@ class LatentPlannerRuntime(nn.Module):
 
         arch = payload["arch"]
         lewm = load_lewm(payload["lewm_checkpoint"])
-        flow = LatentPathFlow(**arch["flow"])
+        flow_cls = (
+            UncertaintyLatentPathFlow
+            if arch.get("flow_type") == "uncertainty"
+            else LatentPathFlow
+        )
+        flow = flow_cls(**arch["flow"])
         inverse_dynamics = InverseDynamics(**arch["inverse_dynamics"])
         flow.load_state_dict(payload["flow_state_dict"])
         inverse_dynamics.load_state_dict(payload["inverse_dynamics_state_dict"])
@@ -601,6 +681,87 @@ def flow_matching_loss(
     return F.mse_loss(pred_v, target - noise)
 
 
+def uncertainty_flow_matching_loss(
+    flow: UncertaintyLatentPathFlow,
+    z_path: torch.Tensor,
+    *,
+    beta: float = 1.0,
+    correction_weight: float = 1.0,
+    density_eps: float = 1e-5,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Conditional uncertainty-aware flow matching (CUFM) beta-NLL.
+
+    This follows Equations (2) and (3) of *Flow Matching with Uncertainty
+    Quantification and Guidance*. The target-velocity correction uses a
+    self-normalized, reweighted mini-batch estimate of the marginal velocity.
+    All returned uncertainty values are diagonal and element-wise.
+    """
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"beta must be in [0, 1], got {beta}")
+    if correction_weight < 0.0:
+        raise ValueError(
+            f"correction_weight must be non-negative, got {correction_weight}"
+        )
+
+    z_start = z_path[:, 0]
+    z_goal = z_path[:, -1]
+    target = z_path[:, 1:-1]
+    noise = torch.randn(
+        target.shape,
+        device=target.device,
+        dtype=target.dtype,
+        generator=generator,
+    )
+    t = torch.rand(
+        z_path.size(0),
+        device=z_path.device,
+        dtype=z_path.dtype,
+        generator=generator,
+    )
+    t_view = t[:, None, None]
+    x_t = (1 - t_view) * noise + t_view * target
+    target_velocity = target - noise
+    mean_velocity, log_variance = flow.forward_with_uncertainty(
+        x_t, t, z_start, z_goal
+    )
+
+    # For query i and batch target j, the rectified conditional path is
+    # N(t_i * target_j, (1 - t_i)^2 I). Its conditional velocity is
+    # (target_j - x_t_i) / (1 - t_i). Normalization terms cancel in the
+    # self-normalized importance weights, so only the quadratic term is used.
+    batch_size = target.size(0)
+    flat_target = target.reshape(batch_size, -1)
+    flat_x_t = x_t.reshape(batch_size, -1)
+    one_minus_t = (1 - t).clamp_min(density_eps)
+    residual = flat_x_t[:, None, :] - t[:, None, None] * flat_target[None, :, :]
+    log_weights = -0.5 * residual.square().sum(dim=-1) / one_minus_t[:, None].square()
+    weights = log_weights.softmax(dim=1)
+    pair_velocity = (
+        flat_target[None, :, :] - flat_x_t[:, None, :]
+    ) / one_minus_t[:, None, None]
+    estimated_velocity = (weights[:, :, None] * pair_velocity).sum(dim=1)
+    estimated_velocity = estimated_velocity.reshape_as(target_velocity)
+
+    correction = estimated_velocity.square() - target_velocity.square()
+    corrected_error = (
+        mean_velocity - target_velocity
+    ).square() + correction_weight * correction
+    variance = log_variance.exp()
+    gaussian_nll = 0.5 * (corrected_error / variance + log_variance)
+    beta_weight = variance.detach().pow(beta)
+    loss = (beta_weight * gaussian_nll).mean()
+
+    metrics = {
+        "flow_mse": F.mse_loss(mean_velocity, target_velocity).detach(),
+        "velocity_variance": variance.mean().detach(),
+        "velocity_std": variance.sqrt().mean().detach(),
+        "log_variance": log_variance.mean().detach(),
+        "correction": correction.mean().detach(),
+    }
+    return loss, metrics
+
+
 def inverse_dynamics_loss(
     inverse_dynamics: InverseDynamics,
     z_path: torch.Tensor,
@@ -643,18 +804,31 @@ def checkpoint_payload(
     inverse_dynamics: InverseDynamics,
     cfg: dict[str, Any],
 ) -> dict[str, Any]:
+    flow_arch = {
+        "latent_dim": flow.latent_dim,
+        "hidden_dim": flow.hidden_dim,
+        "depth": flow.depth,
+        "max_horizon": flow.max_horizon,
+        "time_dim": flow.time_dim,
+        "dropout": flow.dropout,
+    }
+    flow_type = "standard"
+    if isinstance(flow, UncertaintyLatentPathFlow):
+        flow_type = "uncertainty"
+        flow_arch.update(
+            {
+                "min_log_variance": flow.min_log_variance,
+                "max_log_variance": flow.max_log_variance,
+                "variance_init": flow.variance_init,
+            }
+        )
+
     return {
         "lewm_checkpoint": lewm_checkpoint,
         "action_block": action_block,
         "arch": {
-            "flow": {
-                "latent_dim": flow.latent_dim,
-                "hidden_dim": flow.hidden_dim,
-                "depth": flow.depth,
-                "max_horizon": flow.max_horizon,
-                "time_dim": flow.time_dim,
-                "dropout": flow.dropout,
-            },
+            "flow_type": flow_type,
+            "flow": flow_arch,
             "inverse_dynamics": {
                 "latent_dim": inverse_dynamics.latent_dim,
                 "action_dim": inverse_dynamics.action_dim,

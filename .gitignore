@@ -11,3 +11,5 @@ wandb/
 *.tar
 *.tar.zst
 *.zip
+*.out
+*.err

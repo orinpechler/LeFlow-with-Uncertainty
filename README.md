@@ -224,11 +224,14 @@ $STABLEWM_HOME/<subdir>/latent_planner.pt
 
 ## SLURM Helpers
 
-Example one-GPU training:
+Example one-GPU Reacher training:
 
 ```bash
-sbatch --export=ALL,TASK=pusht,HORIZON=5,EPOCHS=10,RUN_NAME=pusht_h5_ep10 \
-  train_latent_planner.slurm
+sbatch --export=ALL,HORIZON=5,EPOCHS=10 \
+  jobs/train_latent_planner.sh
+
+sbatch --export=ALL,HORIZON=5,EPOCHS=10 \
+  jobs/train_latent_uncert_planner.sh
 ```
 
 Example one-GPU evaluation:
@@ -245,7 +248,10 @@ PLANNER_CHECKPOINT=leflow/pusht/latent_planner.pt,HORIZON=5,NUM_EVAL=50 \
 |---|---|
 | [`latent_planner.py`](latent_planner.py) | LeFlow modules and solver wrapper |
 | [`train_latent_planner.py`](train_latent_planner.py) | Training entry point |
+| [`train_latent_uncert_planner.py`](train_latent_uncert_planner.py) | Uncertainty-aware training entry point |
 | [`config/train/latent_planner.yaml`](config/train/latent_planner.yaml) | Training config |
+| [`jobs/train_latent_planner.sh`](jobs/train_latent_planner.sh) | Snellius Reacher training job |
+| [`jobs/train_latent_uncert_planner.sh`](jobs/train_latent_uncert_planner.sh) | Snellius uncertainty-aware Reacher training job |
 | [`config/eval/solver/latent_flow.yaml`](config/eval/solver/latent_flow.yaml) | Evaluation solver config |
 | [`eval.py`](eval.py) | LeWM-compatible evaluation entry point |
 
