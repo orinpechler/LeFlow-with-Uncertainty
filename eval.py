@@ -5,6 +5,7 @@ os.environ["MUJOCO_GL"] = "egl"
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import hydra
 import numpy as np
@@ -25,17 +26,6 @@ def img_transform(cfg):
         ]
     )
     return transform
-
-
-def get_episodes_length(dataset, episodes):
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-
-    episode_idx = dataset.get_col_data(col_name)
-    step_idx = dataset.get_col_data("step_idx")
-    lengths = []
-    for ep_id in episodes:
-        lengths.append(np.max(step_idx[episode_idx == ep_id]) + 1)
-    return np.array(lengths)
 
 
 def get_dataset(cfg, dataset_name):
@@ -72,6 +62,21 @@ def load_heldout_episodes(cfg: DictConfig) -> set[int] | None:
     return episodes
 
 
+def jsonable(value: Any) -> Any:
+    """Convert evaluation outputs to standard JSON-compatible values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    return value
+
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
@@ -92,7 +97,6 @@ def run(cfg: DictConfig):
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
     stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
     heldout_episodes = load_heldout_episodes(cfg)
 
     process = {}
@@ -133,29 +137,42 @@ def run(cfg: DictConfig):
     else:
         policy = swm.policy.RandomPolicy()
 
-    results_path = (
+    default_results_dir = (
         Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
         if cfg.policy != "random"
         else Path(__file__).parent
     )
+    video_dir = cfg.output.get("video_dir", "checkpoint")
+    if video_dir is None:
+        video_path = None
+    elif video_dir == "checkpoint":
+        video_path = default_results_dir
+    else:
+        video_path = Path(video_dir)
 
     # sample the episodes and the starting indices
-    episode_len = get_episodes_length(dataset, ep_indices)
-    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
-    max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    max_start_per_row = np.array(
-        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
+    episode_positions = (
+        sorted(heldout_episodes)
+        if heldout_episodes is not None
+        else range(len(dataset.lengths))
     )
-
-    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
-    valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
-    if heldout_episodes is not None:
-        episode_col = dataset.get_col_data(col_name)
-        valid_mask &= np.isin(episode_col, list(heldout_episodes))
-    valid_indices = np.nonzero(valid_mask)[0]
-    print(valid_mask.sum(), "valid starting points found for evaluation.")
+    invalid_positions = [
+        ep for ep in episode_positions if ep < 0 or ep >= len(dataset.lengths)
+    ]
+    if invalid_positions:
+        raise ValueError(
+            f"Episode split contains IDs outside the dataset: {invalid_positions[:10]}"
+        )
+    valid_ranges = [
+        np.arange(
+            int(dataset.offsets[ep]),
+            int(dataset.offsets[ep])
+            + max(int(dataset.lengths[ep]) - cfg.eval.goal_offset_steps, 0),
+        )
+        for ep in episode_positions
+    ]
+    valid_indices = np.concatenate(valid_ranges)
+    print(len(valid_indices), "valid starting points found for evaluation.")
 
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
@@ -176,20 +193,20 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
 
     start_time = time.time()
-    metrics = world.evaluate_from_dataset(
-        dataset,
+    metrics = world.evaluate(
+        dataset=dataset,
         start_steps=eval_start_idx.tolist(),
-        goal_offset_steps=cfg.eval.goal_offset_steps,
+        goal_offset=cfg.eval.goal_offset_steps,
         eval_budget=cfg.eval.eval_budget,
         episodes_idx=eval_episodes.tolist(),
         callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=results_path,
+        video=video_path,
     )
     end_time = time.time()
-    
+
     print(metrics)
 
-    results_path = results_path / cfg.output.filename
+    results_path = default_results_dir / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
 
     with results_path.open("a") as f:
@@ -202,6 +219,21 @@ def run(cfg: DictConfig):
         f.write("==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
+
+    json_filename = cfg.output.get("json_filename")
+    if json_filename:
+        json_path = Path(json_filename)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "seed": int(cfg.seed),
+            "checkpoint": str(cfg.policy),
+            "num_episodes": int(cfg.eval.num_eval),
+            "metrics": jsonable(metrics),
+            "evaluation_time_seconds": end_time - start_time,
+        }
+        with json_path.open("w") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
 
 
 if __name__ == "__main__":

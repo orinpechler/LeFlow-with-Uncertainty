@@ -4,6 +4,7 @@ __pycache__/
 .hydra/
 outputs/
 log/
+results/
 wandb/
 *.pt
 *.ckpt

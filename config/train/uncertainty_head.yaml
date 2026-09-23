@@ -1,0 +1,26 @@
+defaults:
+  - finetune_for_uncertainty
+  - _self_
+
+output_model_name: latent_planner_uncertainty_head
+subdir: latent_planner_uncertainty_head/${now:%Y-%m-%d_%H-%M-%S}
+
+wandb:
+  project: lewm-latent-planner-uncertainty-head
+  name: ${output_model_name}_h${planner.horizon}
+
+# The flow transformer already supplies contextualized path-token features.
+# A two-layer token-wise MLP adds capacity while keeping head-only training
+# substantially smaller than another transformer stack.
+uncertainty:
+  # Train against errors in completed LeFlow paths. The head is evaluated once
+  # on the generated trajectory; no velocity-variance propagation is used.
+  target: trajectory
+  flow_steps: ${planner.flow_steps_eval}
+  hidden_dim: 256
+  depth: 2
+  dropout: 0.0
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-4

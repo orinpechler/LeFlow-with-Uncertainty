@@ -293,33 +293,75 @@ class LatentPathFlow(nn.Module):
 
 
 class UncertaintyLatentPathFlow(LatentPathFlow):
-    """Latent path flow with diagonal heteroscedastic velocity variance.
+    """Latent path flow with diagonal heteroscedastic velocity uncertainty.
 
     ``forward`` deliberately keeps the :class:`LatentPathFlow` contract and
     returns the mean velocity. Training code can call
     :meth:`forward_with_uncertainty` to additionally receive element-wise log
-    variance. This lets existing latent planner inference consume uncertainty
-    checkpoints without changing its solver interface.
+    standard deviation. This lets existing latent planner inference consume
+    uncertainty checkpoints without changing its solver interface.
     """
 
     def __init__(
         self,
         *args,
-        min_log_variance: float = -10.0,
-        max_log_variance: float = 10.0,
-        variance_init: float = 0.0,
+        min_log_sigma: float = -7.0,
+        max_log_sigma: float = 5.0,
+        log_sigma_init: float = 0.0,
+        uncertainty_hidden_dim: int | None = None,
+        uncertainty_depth: int = 1,
+        uncertainty_dropout: float = 0.0,
+        # Backward-compatible aliases for checkpoints made by the original
+        # uncertainty-training prototype. New checkpoints use log-sigma, as in
+        # the official UA-Flow implementation.
+        min_log_variance: float | None = None,
+        max_log_variance: float | None = None,
+        variance_init: float | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.min_log_variance = min_log_variance
-        self.max_log_variance = max_log_variance
-        self.variance_init = variance_init
-        self.uncertainty_out = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.latent_dim),
-        )
+        if min_log_variance is not None:
+            min_log_sigma = 0.5 * min_log_variance
+        if max_log_variance is not None:
+            max_log_sigma = 0.5 * max_log_variance
+        if variance_init is not None:
+            log_sigma_init = 0.5 * variance_init
+        if min_log_sigma >= max_log_sigma:
+            raise ValueError(
+                "min_log_sigma must be smaller than max_log_sigma, got "
+                f"{min_log_sigma} >= {max_log_sigma}"
+            )
+        self.min_log_sigma = min_log_sigma
+        self.max_log_sigma = max_log_sigma
+        self.log_sigma_init = log_sigma_init
+        self.uncertainty_hidden_dim = uncertainty_hidden_dim or self.hidden_dim
+        self.uncertainty_depth = uncertainty_depth
+        self.uncertainty_dropout = uncertainty_dropout
+        if self.uncertainty_hidden_dim < 1:
+            raise ValueError(
+                "uncertainty_hidden_dim must be positive, got "
+                f"{self.uncertainty_hidden_dim}"
+            )
+        if uncertainty_depth < 1:
+            raise ValueError(
+                f"uncertainty_depth must be at least 1, got {uncertainty_depth}"
+            )
+        uncertainty_layers: list[nn.Module] = [nn.LayerNorm(self.hidden_dim)]
+        uncertainty_in_dim = self.hidden_dim
+        for _ in range(uncertainty_depth - 1):
+            uncertainty_layers.extend(
+                [
+                    nn.Linear(uncertainty_in_dim, self.uncertainty_hidden_dim),
+                    nn.SiLU(),
+                ]
+            )
+            if uncertainty_dropout > 0:
+                uncertainty_layers.append(nn.Dropout(uncertainty_dropout))
+            uncertainty_in_dim = self.uncertainty_hidden_dim
+        uncertainty_layers.append(nn.Linear(uncertainty_in_dim, self.latent_dim))
+        self.uncertainty_out = nn.Sequential(*uncertainty_layers)
         nn.init.zeros_(self.uncertainty_out[-1].weight)
-        nn.init.constant_(self.uncertainty_out[-1].bias, variance_init)
+        nn.init.constant_(self.uncertainty_out[-1].bias, log_sigma_init)
 
     def forward_with_uncertainty(
         self,
@@ -330,11 +372,29 @@ class UncertaintyLatentPathFlow(LatentPathFlow):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         features = self._features(x_t, t, z_start, z_goal)
         mean_velocity = self.out(features)
-        log_variance = self.uncertainty_out(features).clamp(
-            min=self.min_log_variance,
-            max=self.max_log_variance,
+        log_sigma = self.uncertainty_out(features).clamp(
+            min=self.min_log_sigma,
+            max=self.max_log_sigma,
         )
-        return mean_velocity, log_variance
+        return mean_velocity, log_sigma
+
+    def trajectory_log_sigma(
+        self,
+        interior_path: torch.Tensor,
+        z_start: torch.Tensor,
+        z_goal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict uncertainty directly for a completed generated path."""
+        t = torch.ones(
+            interior_path.size(0),
+            device=interior_path.device,
+            dtype=interior_path.dtype,
+        )
+        features = self._features(interior_path, t, z_start, z_goal)
+        return self.uncertainty_out(features).clamp(
+            min=self.min_log_sigma,
+            max=self.max_log_sigma,
+        )
 
 
 class InverseDynamics(nn.Module):
@@ -463,6 +523,36 @@ class LatentPlannerRuntime(nn.Module):
         goal = zg[:, None]
         return torch.cat([start, x, goal], dim=1).reshape(b, num_samples, horizon + 1, d)
 
+    @torch.no_grad()
+    def trajectory_variance(self, paths: torch.Tensor) -> torch.Tensor:
+        """Return direct per-token variance for completed sampled paths.
+
+        Start and goal are observed conditioning tokens, so their variance is
+        represented as zero. The learned head predicts the interior tokens.
+        """
+        if not isinstance(self.flow, UncertaintyLatentPathFlow):
+            raise TypeError("Trajectory uncertainty requires an uncertainty checkpoint")
+        if paths.ndim != 4:
+            raise ValueError(
+                "Expected paths with shape (batch, samples, horizon + 1, latent_dim), "
+                f"got {tuple(paths.shape)}"
+            )
+        batch_size, num_samples, _, latent_dim = paths.shape
+        flat_paths = paths.reshape(batch_size * num_samples, paths.size(2), latent_dim)
+        log_sigma = self.flow.trajectory_log_sigma(
+            flat_paths[:, 1:-1],
+            flat_paths[:, 0],
+            flat_paths[:, -1],
+        )
+        interior_variance = torch.exp(2.0 * log_sigma)
+        endpoint_variance = interior_variance.new_zeros(
+            batch_size * num_samples, 1, latent_dim
+        )
+        full_variance = torch.cat(
+            [endpoint_variance, interior_variance, endpoint_variance], dim=1
+        )
+        return full_variance.reshape_as(paths)
+
     def decode_actions(self, paths: torch.Tensor) -> torch.Tensor:
         z_t = paths[..., :-1, :]
         z_next = paths[..., 1:, :]
@@ -551,12 +641,24 @@ class LatentPlannerRuntime(nn.Module):
 
         best = cost.argmin(dim=1)
         batch_idx = torch.arange(actions.size(0), device=actions.device)
-        return {
+        result = {
             "actions": actions[batch_idx, best].detach().cpu(),
+            "paths": paths[batch_idx, best].detach().cpu(),
             "costs": cost[batch_idx, best].detach().cpu(),
             "all_costs": cost.detach().cpu(),
             "goal_costs": goal_cost.detach().cpu(),
         }
+        if isinstance(self.flow, UncertaintyLatentPathFlow):
+            path_variance = self.trajectory_variance(paths)
+            uncertainty_scores = path_variance[:, :, 1:-1].mean(dim=(-1, -2))
+            result.update(
+                {
+                    "path_variance": path_variance[batch_idx, best].detach().cpu(),
+                    "uncertainty": uncertainty_scores[batch_idx, best].detach().cpu(),
+                    "all_uncertainties": uncertainty_scores.detach().cpu(),
+                }
+            )
+        return result
 
     @torch.no_grad()
     def rollout_paths(
@@ -640,6 +742,8 @@ class LearnedLatentPathSolver:
         all_actions = []
         all_costs = []
         all_goal_costs = []
+        all_uncertainties = []
+        all_path_variances = []
         for start in range(0, total_envs, self.batch_size):
             end = min(start + self.batch_size, total_envs)
             batch = {k: v[start:end] for k, v in info_dict.items()}
@@ -658,12 +762,19 @@ class LearnedLatentPathSolver:
             all_actions.append(out["actions"])
             all_costs.append(out["costs"])
             all_goal_costs.append(out["goal_costs"])
-        return {
+            if "uncertainty" in out:
+                all_uncertainties.append(out["uncertainty"])
+                all_path_variances.append(out["path_variance"])
+        result = {
             "actions": torch.cat(all_actions, dim=0),
             "costs": torch.cat(all_costs, dim=0).tolist(),
             "goal_costs": torch.cat(all_goal_costs, dim=0),
             "rollout_count": self.model.rollout_count,
         }
+        if all_uncertainties:
+            result["uncertainty"] = torch.cat(all_uncertainties, dim=0)
+            result["path_variance"] = torch.cat(all_path_variances, dim=0)
+        return result
 
 
 def flow_matching_loss(
@@ -687,7 +798,7 @@ def uncertainty_flow_matching_loss(
     *,
     beta: float = 1.0,
     correction_weight: float = 1.0,
-    density_eps: float = 1e-5,
+    density_eps: float = 1e-8,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Conditional uncertainty-aware flow matching (CUFM) beta-NLL.
@@ -703,6 +814,8 @@ def uncertainty_flow_matching_loss(
         raise ValueError(
             f"correction_weight must be non-negative, got {correction_weight}"
         )
+    if density_eps <= 0.0:
+        raise ValueError(f"density_eps must be positive, got {density_eps}")
 
     z_start = z_path[:, 0]
     z_goal = z_path[:, -1]
@@ -722,7 +835,7 @@ def uncertainty_flow_matching_loss(
     t_view = t[:, None, None]
     x_t = (1 - t_view) * noise + t_view * target
     target_velocity = target - noise
-    mean_velocity, log_variance = flow.forward_with_uncertainty(
+    mean_velocity, log_sigma = flow.forward_with_uncertainty(
         x_t, t, z_start, z_goal
     )
 
@@ -737,27 +850,110 @@ def uncertainty_flow_matching_loss(
     residual = flat_x_t[:, None, :] - t[:, None, None] * flat_target[None, :, :]
     log_weights = -0.5 * residual.square().sum(dim=-1) / one_minus_t[:, None].square()
     weights = log_weights.softmax(dim=1)
-    pair_velocity = (
-        flat_target[None, :, :] - flat_x_t[:, None, :]
-    ) / one_minus_t[:, None, None]
-    estimated_velocity = (weights[:, :, None] * pair_velocity).sum(dim=1)
-    estimated_velocity = estimated_velocity.reshape_as(target_velocity)
+    # Since the weights sum to one, first averaging the targets is equivalent
+    # to materializing every pairwise velocity. This avoids another B x B x D
+    # tensor, which is significant for latent paths with hundreds of features.
+    weighted_target = weights @ flat_target
+    estimated_velocity = (
+        weighted_target - flat_x_t
+    ) / one_minus_t[:, None]
+    estimated_velocity = estimated_velocity.reshape_as(target_velocity).detach()
 
     correction = estimated_velocity.square() - target_velocity.square()
-    corrected_error = (
-        mean_velocity - target_velocity
-    ).square() + correction_weight * correction
-    variance = log_variance.exp()
-    gaussian_nll = 0.5 * (corrected_error / variance + log_variance)
+    squared_error = (mean_velocity - target_velocity).square()
+    inverse_variance = torch.exp(-2.0 * log_sigma)
+    weighted_mse = 0.5 * inverse_variance * squared_error
+    hat_correction = 0.5 * inverse_variance * correction_weight * correction
+    gaussian_nll = weighted_mse + log_sigma + hat_correction
+    variance = torch.exp(2.0 * log_sigma)
     beta_weight = variance.detach().pow(beta)
     loss = (beta_weight * gaussian_nll).mean()
 
     metrics = {
-        "flow_mse": F.mse_loss(mean_velocity, target_velocity).detach(),
+        "flow_mse": squared_error.mean().detach(),
+        "weighted_mse": weighted_mse.mean().detach(),
+        "hat_correction": hat_correction.mean().detach(),
         "velocity_variance": variance.mean().detach(),
-        "velocity_std": variance.sqrt().mean().detach(),
-        "log_variance": log_variance.mean().detach(),
-        "correction": correction.mean().detach(),
+        "velocity_std": log_sigma.exp().mean().detach(),
+        "log_sigma": log_sigma.mean().detach(),
+    }
+    return loss, metrics
+
+
+@torch.no_grad()
+def sample_flow_interiors(
+    flow: LatentPathFlow,
+    z_start: torch.Tensor,
+    z_goal: torch.Tensor,
+    *,
+    num_tokens: int,
+    flow_steps: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample completed interior trajectory tokens from a frozen flow."""
+    if num_tokens < 1:
+        raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+    if flow_steps < 1:
+        raise ValueError(f"flow_steps must be positive, got {flow_steps}")
+    x = torch.randn(
+        z_start.size(0),
+        num_tokens,
+        z_start.size(-1),
+        device=z_start.device,
+        dtype=z_start.dtype,
+        generator=generator,
+    )
+    dt = 1.0 / flow_steps
+    for step in range(flow_steps):
+        t = torch.full(
+            (z_start.size(0),),
+            step * dt,
+            device=z_start.device,
+            dtype=z_start.dtype,
+        )
+        x.add_(flow(x, t, z_start, z_goal), alpha=dt)
+    return x
+
+
+def trajectory_uncertainty_loss(
+    flow: UncertaintyLatentPathFlow,
+    z_path: torch.Tensor,
+    *,
+    flow_steps: int,
+    beta: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Train uncertainty directly on frozen LeFlow's completed trajectories.
+
+    The sampled trajectory is the fixed predictive mean, and the demonstrated
+    latent trajectory is the target. No velocity uncertainty is propagated
+    through the solver.
+    """
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"beta must be in [0, 1], got {beta}")
+    z_start = z_path[:, 0]
+    z_goal = z_path[:, -1]
+    target = z_path[:, 1:-1]
+    generated = sample_flow_interiors(
+        flow,
+        z_start,
+        z_goal,
+        num_tokens=target.size(1),
+        flow_steps=flow_steps,
+        generator=generator,
+    )
+    log_sigma = flow.trajectory_log_sigma(generated, z_start, z_goal)
+    squared_error = (generated - target).square()
+    variance = torch.exp(2.0 * log_sigma)
+    nll = 0.5 * squared_error / variance + log_sigma
+    beta_weight = variance.detach().pow(beta)
+    loss = (beta_weight * nll).mean()
+    metrics = {
+        "trajectory_mse": squared_error.mean().detach(),
+        "trajectory_nll": nll.mean().detach(),
+        "trajectory_variance": variance.mean().detach(),
+        "trajectory_std": log_sigma.exp().mean().detach(),
+        "log_sigma": log_sigma.mean().detach(),
     }
     return loss, metrics
 
@@ -817,9 +1013,12 @@ def checkpoint_payload(
         flow_type = "uncertainty"
         flow_arch.update(
             {
-                "min_log_variance": flow.min_log_variance,
-                "max_log_variance": flow.max_log_variance,
-                "variance_init": flow.variance_init,
+                "min_log_sigma": flow.min_log_sigma,
+                "max_log_sigma": flow.max_log_sigma,
+                "log_sigma_init": flow.log_sigma_init,
+                "uncertainty_hidden_dim": flow.uncertainty_hidden_dim,
+                "uncertainty_depth": flow.uncertainty_depth,
+                "uncertainty_dropout": flow.uncertainty_dropout,
             }
         )
 

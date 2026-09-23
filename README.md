@@ -230,17 +230,61 @@ Example one-GPU Reacher training:
 sbatch --export=ALL,HORIZON=5,EPOCHS=10 \
   jobs/train_latent_planner.sh
 
-sbatch --export=ALL,HORIZON=5,EPOCHS=10 \
-  jobs/train_latent_uncert_planner.sh
+sbatch jobs/finetune_for_uncertainty.sh 1
+sbatch jobs/finetune_for_uncertainty.sh 2
+
+sbatch jobs/train_uncertainty_head.sh 1
+sbatch jobs/train_uncertainty_head.sh 2
 ```
 
-Example one-GPU evaluation:
+The argument selects the epoch-1 or epoch-2 vanilla LeFlow checkpoint. The
+fine-tuning job keeps the pretrained inverse-dynamics model and LeWM frozen,
+adds a zero-initialized uncertainty head, and fine-tunes the flow with the
+UA-Flow corrected beta-NLL objective. Outputs are written under
+`$STABLEWM_HOME/checkpoints/latent_planner_uncertainty/`.
+
+The `train_uncertainty_head.sh` variant freezes the complete pretrained flow
+and trains only a two-layer uncertainty MLP against errors in completed,
+sampled latent trajectories. It does not propagate velocity variance through
+the flow solver. Its outputs are written under
+`$STABLEWM_HOME/checkpoints/latent_planner_uncertainty_head/`. Enable Weights &
+Biases by passing `WANDB_ENABLED=true` in the `sbatch --export` values. Set
+`WANDB_LOG_MODEL=true` there as well to upload the latest checkpoint artifact.
+
+The same head-only training can be run directly:
 
 ```bash
-sbatch --export=ALL,CONFIG_NAME=pusht.yaml,SOLVER=latent_flow,\
-PLANNER_CHECKPOINT=leflow/pusht/latent_planner.pt,HORIZON=5,NUM_EVAL=50 \
-  eval_latent_planner.slurm
+python train_uncertainty_head.py \
+  pretrained_checkpoint=/path/to/latent_planner.pt \
+  data.dataset.name=reacher \
+  data.dataset.keys_to_load='[pixels,action,observation]' \
+  data.dataset.keys_to_cache='[action,observation]' \
+  planner.horizon=5 \
+  planner.max_horizon=20 \
+  planner.action_block=5
 ```
+
+The frozen flow first generates a complete latent path. The head reads its
+contextual path-token features and predicts one log standard deviation per
+interior latent trajectory element. A beta-NLL objective compares that fixed
+generated path with the demonstrated latent path. LeWM, inverse dynamics, and
+every pretrained flow parameter remain frozen. At inference the runtime
+returns `path_variance` with the same shape as the chosen path and a scalar
+`uncertainty` averaged over its interior elements. The fixed start and goal
+tokens have zero variance. Training and validation metrics are logged to WandB
+when `wandb.enabled=true`.
+
+Example one-GPU Reacher evaluation over the five LeFlow seeds (42--46), using
+either the epoch-1 or epoch-2 checkpoint:
+
+```bash
+sbatch jobs/eval_latent_planner.sh 1
+sbatch jobs/eval_latent_planner.sh 2
+```
+
+Each job evaluates 50 episodes per seed and writes the per-seed results plus
+the cross-seed mean and population standard deviation under
+`results/reacher/epoch_<N>/run_<job-id>/`.
 
 ## Key Files
 
@@ -248,10 +292,16 @@ PLANNER_CHECKPOINT=leflow/pusht/latent_planner.pt,HORIZON=5,NUM_EVAL=50 \
 |---|---|
 | [`latent_planner.py`](latent_planner.py) | LeFlow modules and solver wrapper |
 | [`train_latent_planner.py`](train_latent_planner.py) | Training entry point |
-| [`train_latent_uncert_planner.py`](train_latent_uncert_planner.py) | Uncertainty-aware training entry point |
+| [`finetune_for_uncertainty.py`](finetune_for_uncertainty.py) | UA-Flow uncertainty fine-tuning entry point |
+| [`train_uncertainty_head.py`](train_uncertainty_head.py) | Frozen-flow uncertainty-head training entry point |
 | [`config/train/latent_planner.yaml`](config/train/latent_planner.yaml) | Training config |
+| [`config/train/finetune_for_uncertainty.yaml`](config/train/finetune_for_uncertainty.yaml) | UA-Flow fine-tuning config |
+| [`config/train/uncertainty_head.yaml`](config/train/uncertainty_head.yaml) | Frozen-flow uncertainty-head config |
 | [`jobs/train_latent_planner.sh`](jobs/train_latent_planner.sh) | Snellius Reacher training job |
-| [`jobs/train_latent_uncert_planner.sh`](jobs/train_latent_uncert_planner.sh) | Snellius uncertainty-aware Reacher training job |
+| [`jobs/finetune_for_uncertainty.sh`](jobs/finetune_for_uncertainty.sh) | Snellius uncertainty fine-tuning job |
+| [`jobs/train_uncertainty_head.sh`](jobs/train_uncertainty_head.sh) | Snellius frozen-flow uncertainty-head job |
+| [`jobs/eval_latent_planner.sh`](jobs/eval_latent_planner.sh) | Five-seed Snellius Reacher evaluation job |
+| [`scripts/summarize_eval_results.py`](scripts/summarize_eval_results.py) | Cross-seed evaluation summary |
 | [`config/eval/solver/latent_flow.yaml`](config/eval/solver/latent_flow.yaml) | Evaluation solver config |
 | [`eval.py`](eval.py) | LeWM-compatible evaluation entry point |
 

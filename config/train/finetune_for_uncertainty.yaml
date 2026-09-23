@@ -1,0 +1,43 @@
+defaults:
+  - latent_planner
+  - _self_
+
+# A standard LeFlow planner checkpoint. The Snellius job supplies either the
+# epoch-1 or epoch-2 file through this field.
+pretrained_checkpoint: ???
+lewm_checkpoint: null
+
+output_model_name: latent_planner_uncertainty
+subdir: latent_planner_uncertainty/${now:%Y-%m-%d_%H-%M-%S}
+epochs: 1
+
+wandb:
+  project: lewm-latent-planner-uncertainty
+  name: ${output_model_name}_h${planner.horizon}
+
+# Settings matched to the official UA-Flow fine-tuning implementation:
+# separate zero-initialized log-sigma head, corrected beta-NLL, gentle
+# backbone updates, LR warmup, gradient clipping, and EMA evaluation weights.
+uncertainty:
+  target: velocity
+  beta: 1.0
+  include_hat_term: true
+  correction_weight: 1.0
+  density_eps: 1e-8
+  min_log_sigma: -7.0
+  max_log_sigma: 5.0
+  log_sigma_init: 0.0
+
+optimizer:
+  lr: 1e-5
+  backbone_lr_scale: 0.1
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  warmup_steps: 1000
+  warmup_start_lr: 1e-8
+
+grad_clip_norm: 1.0
+
+ema:
+  enabled: true
+  decay: 0.9999
