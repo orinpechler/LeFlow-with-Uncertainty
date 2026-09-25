@@ -475,6 +475,9 @@ class LatentPlannerRuntime(nn.Module):
             inverse_dynamics=inverse_dynamics,
             action_block=payload.get("action_block", 1),
         )
+        model.checkpoint_config = payload.get("config", {})
+        model.uncertainty_target = payload.get("uncertainty_target")
+        model.training_mode = payload.get("training_mode")
         return model.to(device).eval()
 
     @torch.no_grad()
@@ -605,6 +608,38 @@ class LatentPlannerRuntime(nn.Module):
             flow_steps=flow_steps,
             generator=generator,
         )
+        path_variance = None
+        uncertainty_scores = None
+        if isinstance(self.flow, UncertaintyLatentPathFlow):
+            path_variance = self.trajectory_variance(paths)
+            uncertainty_scores = path_variance[:, :, 1:-1].mean(dim=(-1, -2))
+        return self.rank_paths(
+            z_start, z_goal, paths,
+            score_mode=score_mode,
+            goal_weight=goal_weight,
+            consistency_weight=consistency_weight,
+            smoothness_weight=smoothness_weight,
+            history_size=history_size,
+            uncertainty_scores=uncertainty_scores,
+            path_variance=path_variance,
+        )
+
+    @torch.no_grad()
+    def rank_paths(
+        self,
+        z_start: torch.Tensor,
+        z_goal: torch.Tensor,
+        paths: torch.Tensor,
+        *,
+        score_mode: str = "rollout_goal",
+        goal_weight: float = 1.0,
+        consistency_weight: float = 0.0,
+        smoothness_weight: float = 0.0,
+        history_size: int = 3,
+        uncertainty_scores: torch.Tensor | None = None,
+        path_variance: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Apply the usual action decoding and rollout ranking to supplied paths."""
         actions = self.decode_actions(paths)
         score_mode = score_mode.lower()
         if score_mode == "rollout_goal":
@@ -647,17 +682,17 @@ class LatentPlannerRuntime(nn.Module):
             "costs": cost[batch_idx, best].detach().cpu(),
             "all_costs": cost.detach().cpu(),
             "goal_costs": goal_cost.detach().cpu(),
+            "selected_index": best.detach().cpu(),
         }
-        if isinstance(self.flow, UncertaintyLatentPathFlow):
-            path_variance = self.trajectory_variance(paths)
-            uncertainty_scores = path_variance[:, :, 1:-1].mean(dim=(-1, -2))
+        if uncertainty_scores is not None:
             result.update(
                 {
-                    "path_variance": path_variance[batch_idx, best].detach().cpu(),
                     "uncertainty": uncertainty_scores[batch_idx, best].detach().cpu(),
                     "all_uncertainties": uncertainty_scores.detach().cpu(),
                 }
             )
+        if path_variance is not None:
+            result["path_variance"] = path_variance[batch_idx, best].detach().cpu()
         return result
 
     @torch.no_grad()
@@ -681,6 +716,8 @@ class LatentPlannerRuntime(nn.Module):
 
 class LearnedLatentPathSolver:
     """stable-worldmodel solver wrapper for the learned latent planner."""
+
+    runtime_class = LatentPlannerRuntime
 
     def __init__(
         self,
@@ -709,7 +746,7 @@ class LearnedLatentPathSolver:
             requested_device = torch.device("cpu")
         self.device = requested_device
         self.history_size = history_size
-        self.model = LatentPlannerRuntime.from_checkpoint(checkpoint, device=self.device)
+        self.model = self.runtime_class.from_checkpoint(checkpoint, device=self.device)
         self.torch_gen = torch.Generator(device=self.device).manual_seed(seed)
 
     def configure(self, *, action_space: gym.Space, n_envs: int, config: Any) -> None:

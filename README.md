@@ -286,6 +286,59 @@ Each job evaluates 50 episodes per seed and writes the per-seed results plus
 the cross-seed mean and population standard deviation under
 `results/reacher/epoch_<N>/run_<job-id>/`.
 
+### Evaluation with uncertainty filtering
+
+`eval_with_uncertainty.py` follows the episode selection, policy, ranking, and
+metrics setup in `eval.py`. At every planning call it generates `num_samples`
+candidates per environment, retains those with uncertainty **<= threshold**,
+and samples only the missing candidates until there are exactly `num_samples`
+approved paths. The ordinary rollout-goal ranking then chooses among these
+paths. Nonfinite scores or paths are rejected. Filtering can require more
+generation time; the default is still 64 **accepted** candidates, not 64 total
+proposals.
+
+The checkpoint's training metadata selects the uncertainty source automatically:
+
+- `velocity`: mean predicted variance (`exp(2 * log_sigma)`) over Euler flow
+  steps and interior latent elements. This is a velocity-uncertainty score;
+  it does not propagate covariance into final-path variance.
+- `trajectory`: mean predicted variance over the completed path's interior
+  latent elements, using the separate head at flow time 1. Fixed endpoints
+  are excluded from both scores.
+
+Choose a threshold separately for each checkpoint and source using held-out
+data: these two score scales are not interchangeable. There is deliberately
+no default threshold. For an old checkpoint without target metadata, specify
+`solver.uncertainty_source=velocity` or `trajectory` according to its training.
+A source that contradicts known checkpoint metadata is rejected.
+
+```bash
+# Replace the path and illustrative 0.5 threshold with your checkpoint and threshold.
+python eval_with_uncertainty.py --config-name=reacher.yaml \
+  solver=latent_flow_uncertainty policy=/absolute/path/to/checkpoint.pt \
+  solver.uncertainty_threshold=0.5 \
+  +output.json_filename=uncertainty_results.json +output.video_dir=null
+
+# Five-seed Snellius evaluation, for either checkpoint type:
+sbatch jobs/eval_latent_uncertainty_planner.sh /absolute/path/to/checkpoint.pt 0.5
+```
+
+The batch job retains the standard 50 episodes per seed (42--46), 16 flow
+steps, and 64 accepted candidates. It writes results to
+`results/reacher/uncertainty/run_<job-id>/`. Per-seed JSON files include each
+planning batch's accepted candidate scores, selected index and score,
+proposal counts, and replacement rounds. The cross-seed summary also reports
+overall acceptance rate. Runtime includes replacement sampling, while
+`rollout_count` counts world-model rollouts of accepted candidates.
+
+`solver.max_resample_rounds` (batch-job environment variable
+`MAX_RESAMPLE_ROUNDS`) defaults to 100 replacement rounds per environment,
+in addition to the initial draw. Evaluation raises an error if it cannot
+fill all slots, rather than evaluating unapproved candidates. A value of 0
+permits only the initial draw. The batch job also accepts `NUM_SAMPLES`,
+`FLOW_STEPS`, `SOLVER_BATCH_SIZE`, `UNCERTAINTY_SOURCE`, `NUM_EVAL`, and
+`RESULTS_DIR` environment overrides.
+
 ## Key Files
 
 | File | Purpose |
@@ -304,6 +357,10 @@ the cross-seed mean and population standard deviation under
 | [`scripts/summarize_eval_results.py`](scripts/summarize_eval_results.py) | Cross-seed evaluation summary |
 | [`config/eval/solver/latent_flow.yaml`](config/eval/solver/latent_flow.yaml) | Evaluation solver config |
 | [`eval.py`](eval.py) | LeWM-compatible evaluation entry point |
+| [`eval_with_uncertainty.py`](eval_with_uncertainty.py) | Evaluation with uncertainty rejection sampling |
+| [`uncertainty_planner.py`](uncertainty_planner.py) | Uncertainty scoring and replacement sampling |
+| [`config/eval/solver/latent_flow_uncertainty.yaml`](config/eval/solver/latent_flow_uncertainty.yaml) | Uncertainty evaluation solver config |
+| [`jobs/eval_latent_uncertainty_planner.sh`](jobs/eval_latent_uncertainty_planner.sh) | Five-seed Snellius uncertainty evaluation job |
 
 ## Citation
 

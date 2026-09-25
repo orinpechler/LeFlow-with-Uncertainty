@@ -22,7 +22,7 @@ def population_std(values: list[float]) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", required=True, type=Path)
-    parser.add_argument("--checkpoint-epoch", required=True, type=int, choices=(1, 2))
+    parser.add_argument("--checkpoint-epoch", type=int, choices=(1, 2))
     parser.add_argument("--seeds", required=True, type=int, nargs="+")
     return parser.parse_args()
 
@@ -84,6 +84,20 @@ def main() -> None:
         },
     }
 
+    sampling = [result.get("uncertainty_sampling") for result in results]
+    if any(row is not None for row in sampling):
+        if not all(row is not None for row in sampling):
+            raise ValueError("Cannot mix ordinary and uncertainty-filtered evaluation results.")
+        setting_keys = ("source", "score_definition", "threshold", "max_resample_rounds", "num_samples")
+        settings = {key: sampling[0][key] for key in setting_keys}
+        if any(any(row[key] != value for key, value in settings.items()) for row in sampling):
+            raise ValueError("Per-seed results use different uncertainty sampling settings.")
+        totals = {key: sum(row[key] for row in sampling) for key in ("proposed", "accepted", "rejected")}
+        summary["uncertainty_sampling"] = {
+            **settings, **totals,
+            "acceptance_rate": totals["accepted"] / totals["proposed"] if totals["proposed"] else None,
+        }
+
     json_path = args.results_dir / "summary.json"
     with json_path.open("w") as f:
         json.dump(summary, f, indent=2)
@@ -117,6 +131,8 @@ def main() -> None:
             f"total evaluation time: {timing_summary['total']:.2f} seconds",
         ]
     )
+    if "uncertainty_sampling" in summary:
+        lines.extend(["", "uncertainty sampling: " + json.dumps(summary["uncertainty_sampling"])])
     (args.results_dir / "summary.txt").write_text("\n".join(lines) + "\n")
 
 
